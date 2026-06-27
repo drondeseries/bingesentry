@@ -1,0 +1,23 @@
+# Local configuration with private credentials
+config.ini
+
+# Virtual Environment
+venv/
+.venv/
+
+# Logs
+*.log
+*.log.*
+plexrclonecache.log
+bingesentry.log
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# OS-specific files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  bingesentry:
+    image: ghcr.io/drondeseries/bingesentry:latest
+    container_name: bingesentry
+    user: "1000:1000"
+    tty: true
+    stdin_open: true
+    environment:
+     - TZ=America/New_York
+     - RCLONE_CONFIG=/app/config/rclone.conf
+    volumes:
+     - ./data/config:/app/config
+     - /opt/rclone/rclone.conf:/app/config/rclone.conf
+     - /path/to/media:/path/to/media
+     - /path/to/rclone/cache/location://path/to/rclone/cache/location

@@ -1,0 +1,5 @@
+plexapi
+psutil
+rich
+websocket-client
+
