@@ -432,8 +432,14 @@ def main():
         print(f"Error loading configuration: {e}")
         sys.exit(1)
 
+    tui_enabled = config.tui_mode
+    fallback_warning = False
+    if tui_enabled and not sys.stdout.isatty():
+        fallback_warning = True
+        tui_enabled = False
+
     # Setup appropriate logging handlers
-    if config.tui_mode:
+    if tui_enabled:
         from tui import MemoryLogHandler, TUIDashboard
         # Disable direct standard console logging in TUI mode to avoid visual corruption
         setup_logger(config.log_file, config.log_level, log_to_console=False)
@@ -445,27 +451,30 @@ def main():
     else:
         setup_logger(config.log_file, config.log_level, config.log_to_console)
     
+    if fallback_warning:
+        logging.warning("TUI Mode is enabled in configuration, but stdout is not a TTY. Falling back to background daemon mode.")
+
     logging.info("========================================")
     logging.info("BingeSentry Service Initialized")
-    logging.info(f"TUI Mode     : {config.tui_mode}")
+    logging.info(f"TUI Mode     : {tui_enabled}")
     logging.info("========================================")
-    
+
     from queue_manager import CachingQueueManager
     queue_manager = CachingQueueManager(config)
         
     import threading
     scan_trigger_event = threading.Event()
-    
+
     # Initialize connection manager to handle connection & socket retrying/recreation
     conn_manager = PlexConnectionManager(config, scan_trigger_event)
-    if not config.tui_mode:
+    if not tui_enabled:
         conn_manager.connect()
     else:
         # Run connection manager asynchronously in background thread for TUI mode
         threading.Thread(target=conn_manager.connect, daemon=True).start()
         
     try:
-        if config.tui_mode:
+        if tui_enabled:
             dashboard = TUIDashboard(config.plex_url, config, memory_log_handler)
             dashboard.run_loop(conn_manager, queue_manager, check_sessions, scan_trigger_event)
         else:
