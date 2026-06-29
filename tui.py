@@ -354,7 +354,7 @@ class TUIDashboard(App):
         ("r", "retry_task", "Retry Selected"),
     ]
     
-    def __init__(self, plex_url, config, log_handler):
+    def __init__(self, plex_url, config, log_handler, view_only=False):
         super().__init__()
         self.plex_url = plex_url
         self.config = config
@@ -364,6 +364,7 @@ class TUIDashboard(App):
         self.show_history = False
         
         self.active_sessions = []
+        self.view_only = view_only
         
     def compose(self) -> ComposeResult:
         yield Label("BingeSentry Status Dashboard Loading...", id="header")
@@ -386,23 +387,29 @@ class TUIDashboard(App):
         queue_table.show_cursor = True
         queue_table.focus()
         
-        # Populate early logs from handler
-        log_widget = self.query_one("#logs_panel", RichLog)
-        for log in self.log_handler.logs:
-            log_widget.write(log)
+        if self.view_only:
+            self.last_log_offset = 0
+            self.set_interval(1.0, self.tail_log_file)
+            self.set_interval(1.0, self.refresh_dashboard_view_only)
+            self.set_interval(1.0, self.update_system_stats_view_only)
+        else:
+            # Populate early logs from handler
+            log_widget = self.query_one("#logs_panel", RichLog)
+            for log in self.log_handler.logs:
+                log_widget.write(log)
+                
+            # Bind log widget to textual log handler
+            self.textual_log_handler = TextualLogHandler(log_widget)
+            logging.getLogger().addHandler(self.textual_log_handler)
             
-        # Bind log widget to textual log handler
-        self.textual_log_handler = TextualLogHandler(log_widget)
-        logging.getLogger().addHandler(self.textual_log_handler)
-        
-        # Remove the early memory log handler to prevent duplicate formatting overhead
-        logging.getLogger().removeHandler(self.log_handler)
-        
-        # Start intervals
-        self.set_interval(0.5, self.check_trigger_event)
-        self.set_interval(1.0, self.refresh_dashboard)
-        self.set_interval(1.0, self.update_system_stats)
-        self.set_interval(10.0, self.trigger_periodic_scan)
+            # Remove the early memory log handler to prevent duplicate formatting overhead
+            logging.getLogger().removeHandler(self.log_handler)
+            
+            # Start intervals
+            self.set_interval(0.5, self.check_trigger_event)
+            self.set_interval(1.0, self.refresh_dashboard)
+            self.set_interval(1.0, self.update_system_stats)
+            self.set_interval(10.0, self.trigger_periodic_scan)
 
     def trigger_periodic_scan(self):
         """
