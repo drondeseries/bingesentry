@@ -4,7 +4,7 @@ import re
 from logging.handlers import RotatingFileHandler
 
 # Regular expression to strip ANSI color escape codes from log files
-ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 class StripAnsiFormatter(logging.Formatter):
     """

@@ -1,335 +1,627 @@
 import os
+import re
 import time
 import logging
-import psutil
-import sys
-import select
-import termios
-import tty
 from datetime import datetime
-from rich.layout import Layout
-from rich.panel import Panel
-from rich.table import Table
-from rich.live import Live
-from rich.console import Console
-from rich.text import Text
-from rich.box import ROUNDED
-from disk import get_cache_status, is_mount_responsive
+import psutil
+from textual.app import App, ComposeResult
+from textual.screen import ModalScreen
+from textual.widgets import Header, Footer, DataTable, RichLog, Label, Input, Button
+from textual.containers import Grid, Vertical, Container, Horizontal
+from textual.coordinate import Coordinate
+from textual import work, events
+from disk import get_cache_status, is_mount_responsive, get_cpu_percent
 
-class KeyListener:
+def truncate_text(text, max_len=25):
+    if len(text) <= max_len:
+        return text
+    return text[:max_len-3] + "..."
+
+def truncate_path(file_path, max_len=30):
+    if not file_path:
+        return "-"
+    filename = os.path.basename(file_path)
+    if len(filename) <= max_len:
+        return filename
+    name, ext = os.path.splitext(filename)
+    if len(ext) > 6:
+        ext = ""
+    ext_len = len(ext)
+    avail = max_len - 3 - ext_len
+    if avail > 5:
+        return name[:avail] + "..." + ext
+    else:
+        return filename[:max_len-3] + "..."
+
+def get_row_key(table, row_index):
+    try:
+        if row_index is not None:
+            if hasattr(table, "check_row_index"):
+                row_key, _ = table.check_row_index(row_index)
+                return row_key
+            if hasattr(table, "_row_locations") and hasattr(table._row_locations, "get_key"):
+                return table._row_locations.get_key(row_index)
+    except Exception:
+        pass
+    return None
+
+class HoverDataTable(DataTable):
     """
-    Non-blocking keyboard listener using select and termios.
-    Works natively on UNIX-based systems.
+    DataTable subclass that dynamically updates its tooltip with the full path of the row under mouse hover.
+    """
+    def _on_mouse_move(self, event: events.MouseMove) -> None:
+        super()._on_mouse_move(event)
+        try:
+            meta = event.style.meta
+            if meta and "row" in meta:
+                row_idx = meta["row"]
+                row_key = get_row_key(self, row_idx)
+                if row_key and row_key.value:
+                    self.tooltip = f"Full Path:\n{row_key.value}"
+                    return
+        except Exception:
+            pass
+        self.tooltip = None
+
+    def _on_leave(self, event: events.Leave) -> None:
+        super()._on_leave(event)
+        self.tooltip = None
+
+# Regular expression to strip ANSI color escape codes
+ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+# Custom formatter for colorized log output inside Textual RichLog
+class TUILogFormatter(logging.Formatter):
+    """
+    Custom log formatter for the TUI that strips year/date/milliseconds and formats
+    log levels with beautiful Rich markup colors to optimize horizontal space.
     """
     def __init__(self):
-        self.old_settings = None
-        self.active = False
-        
-    def start(self):
-        try:
-            self.old_settings = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-            self.active = True
-        except Exception:
-            self.active = False
-            
-    def stop(self):
-        if self.active and self.old_settings:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
-            self.active = False
-            
-    def get_key(self):
-        if not self.active:
-            return None
-        if select.select([sys.stdin], [], [], 0)[0]:
-            return sys.stdin.read(1)
-        return None
+        super().__init__('%(asctime)s', datefmt='%H:%M:%S')
 
-
+    def format(self, record):
+        asctime = self.formatTime(record, self.datefmt)
+        level = record.levelname
+        if level == "INFO":
+            level_formatted = "[bold green]INFO[/bold green]"
+        elif level == "WARNING":
+            level_formatted = "[bold yellow]WARN[/bold yellow]"
+        elif level == "ERROR":
+            level_formatted = "[bold red]ERR [/bold red]"
+        elif level == "CRITICAL":
+            level_formatted = "[bold blink red]CRIT[/bold blink red]"
+        elif level == "DEBUG":
+            level_formatted = "[bold blue]DBG [/bold blue]"
+        else:
+            level_formatted = f"[bold]{level}[/bold]"
+            
+        message = record.getMessage()
+        # Strip raw ANSI escape color codes from message to prevent garbled text in the TUI
+        message_clean = ANSI_ESCAPE.sub('', message)
+        return f"[dim]{asctime}[/dim] [{level_formatted}] {message_clean}"
 
 
 class MemoryLogHandler(logging.Handler):
     """
-    In-memory logging handler to store the latest logs for real-time display in the TUI.
+    In-memory logging handler to store early startup logs before Textual starts.
     """
-    def __init__(self, capacity=10):
+    def __init__(self, capacity=20):
         super().__init__()
         self.capacity = capacity
         self.logs = []
+        self.setFormatter(TUILogFormatter())
         
     def emit(self, record):
         log_entry = self.format(record)
         self.logs.append(log_entry)
         if len(self.logs) > self.capacity:
             self.logs.pop(0)
-            
-    def get_logs(self):
-        return "\n".join(self.logs)
 
-class CachingTask:
+
+class TextualLogHandler(logging.Handler):
     """
-    Represents an active or completed caching process.
+    Direct handler to stream python logging messages thread-safely into the Textual Log widget.
     """
-    def __init__(self, file_path, size_gb, pid, cmd):
-        self.file_path = file_path
-        self.size_gb = size_gb
-        self.pid = pid
-        self.cmd = cmd
-        self.start_time = time.time()
-        self.status = "Caching"  # Options: Caching, Completed, Failed
+    def __init__(self, log_widget):
+        super().__init__()
+        self.log_widget = log_widget
+        self.setFormatter(TUILogFormatter())
+
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            self.log_widget.app.call_from_thread(self.log_widget.write, log_entry)
+        except Exception:
+            pass
+
+
+class ConfigEditScreen(ModalScreen):
+    """
+    Modal screen for editing BingeSentry configurations.
+    """
+    CSS = """
+    ConfigEditScreen {
+        align: center middle;
+    }
+    
+    #config_dialog {
+        width: 80;
+        height: auto;
+        max-height: 85%;
+        overflow-y: auto;
+        border: thick #5a547a;
+        background: #18142c;
+        padding: 1 2;
+    }
+    
+    #config_title {
+        text-align: center;
+        text-style: bold;
+        color: #ff007f;
+        margin-bottom: 1;
+    }
+    
+    .config_label {
+        color: #f1ecff;
+        text-style: bold;
+        margin-top: 1;
+    }
+    
+    Input {
+        background: #131023;
+        color: #ffffff;
+        border: solid #5a547a;
+        height: 3;
+    }
+    
+    #config_buttons {
+        margin-top: 2;
+        align: right middle;
+    }
+    
+    Button {
+        margin-left: 2;
+    }
+    """
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
         
-    def get_elapsed_time(self):
-        return int(time.time() - self.start_time)
+    def compose(self) -> ComposeResult:
+        with Vertical(id="config_dialog"):
+            yield Label("🔧 BingeSentry Configuration Editor", id="config_title")
+            
+            yield Label("Max Concurrent Caches:", classes="config_label")
+            yield Input(str(self.config.max_concurrent_caches), id="input_concurrent")
+            
+            yield Label("Episodes to Cache Ahead:", classes="config_label")
+            yield Input(str(self.config.episodes_to_cache), id="input_episodes")
+            
+            yield Label("Cache Start Progress Threshold (%):", classes="config_label")
+            yield Input(str(self.config.cache_start_threshold_pct), id="input_threshold")
 
-class TUIDashboard:
+            yield Label("Max CPU Load Limit (%): (0 to disable)", classes="config_label")
+            yield Input(str(self.config.max_cpu_percent_limit), id="input_cpu_limit")
+            
+            yield Label("Max Memory Load Limit (%): (0 to disable)", classes="config_label")
+            yield Input(str(self.config.max_mem_percent_limit), id="input_mem_limit")
+            
+            yield Label("User Whitelist (comma-separated):", classes="config_label")
+            yield Input(", ".join(self.config.user_whitelist), id="input_user_whitelist")
+            
+            yield Label("User Blacklist (comma-separated):", classes="config_label")
+            yield Input(", ".join(self.config.user_blacklist), id="input_user_blacklist")
+            
+            yield Label("Library Whitelist (comma-separated):", classes="config_label")
+            yield Input(", ".join(self.config.library_whitelist), id="input_library_whitelist")
+            
+            yield Label("Library Blacklist (comma-separated):", classes="config_label")
+            yield Input(", ".join(self.config.library_blacklist), id="input_library_blacklist")
+            
+            with Horizontal(id="config_buttons"):
+                yield Button("Save Settings", variant="success", id="save_btn")
+                yield Button("Cancel", variant="error", id="cancel_btn")
+                
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "save_btn":
+            try:
+                max_concurrent = int(self.query_one("#input_concurrent", Input).value)
+                episodes = int(self.query_one("#input_episodes", Input).value)
+                threshold = int(self.query_one("#input_threshold", Input).value)
+                cpu_limit = float(self.query_one("#input_cpu_limit", Input).value)
+                mem_limit = float(self.query_one("#input_mem_limit", Input).value)
+                user_wl = self.query_one("#input_user_whitelist", Input).value
+                user_bl = self.query_one("#input_user_blacklist", Input).value
+                lib_wl = self.query_one("#input_library_whitelist", Input).value
+                lib_bl = self.query_one("#input_library_blacklist", Input).value
+                
+                config_file = self.config.loaded_file or "config.ini"
+                import configparser
+                parser = configparser.ConfigParser()
+                parser.read(config_file)
+                
+                if not parser.has_section("Cache"):
+                    parser.add_section("Cache")
+                    
+                parser.set("Cache", "MAX_CONCURRENT_CACHES", str(max_concurrent))
+                parser.set("Cache", "EPISODES_TO_CACHE", str(episodes))
+                parser.set("Cache", "CACHE_START_THRESHOLD_PCT", str(threshold))
+                parser.set("Cache", "MAX_CPU_PERCENT_LIMIT", str(cpu_limit))
+                parser.set("Cache", "MAX_MEM_PERCENT_LIMIT", str(mem_limit))
+                parser.set("Cache", "USER_WHITELIST", user_wl)
+                parser.set("Cache", "USER_BLACKLIST", user_bl)
+                parser.set("Cache", "LIBRARY_WHITELIST", lib_wl)
+                parser.set("Cache", "LIBRARY_BLACKLIST", lib_bl)
+                
+                with open(config_file, 'w') as f:
+                    parser.write(f)
+                    
+                self.config.config.read(config_file)
+                logging.info("Configuration updated and reloaded successfully.")
+                self.dismiss(True)
+            except ValueError:
+                logging.error("Configuration editor: Failed to save. Numeric inputs must be valid numbers.")
+                self.dismiss(False)
+            except Exception as e:
+                logging.error(f"Configuration editor: Failed to save: {e}")
+                self.dismiss(False)
+        elif event.button.id == "cancel_btn":
+            self.dismiss(False)
+
+
+class TUIDashboard(App):
     """
-    Manages the Rich Live Terminal User Interface.
+    Modern terminal dashboard powered by Textualize.
     """
+    # Sleek dark mode palette with neon highlights
+    CSS = """
+    Screen {
+        background: #0d0b18;
+        overflow-x: hidden;
+    }
+    
+    #header {
+        background: #18142c;
+        color: #f1ecff;
+        height: 3;
+        content-align: center middle;
+        border-bottom: solid magenta;
+        padding: 0 1;
+        text-style: bold;
+    }
+    
+    #body {
+        height: 1fr;
+        layout: grid;
+        grid-size: 2;
+        grid-columns: 3fr 2fr;
+        grid-gutter: 1;
+        padding: 1 1;
+    }
+    
+    DataTable {
+        background: #131023;
+        color: #ded9eb;
+        border: round #5a547a;
+        height: 100%;
+        overflow-x: hidden;
+    }
+    
+    DataTable > .datatable--header {
+        background: #201a3b;
+        color: #ffffff;
+        text-style: bold;
+    }
+    
+    #logs_panel {
+        height: 9;
+        border: round #5a547a;
+        background: #0f0d1d;
+        padding: 0 1;
+        margin: 0 1;
+    }
+    
+    #controls {
+        height: 2;
+        content-align: center middle;
+        background: #18142c;
+        color: #c9bfdf;
+        border-top: solid #5a547a;
+        text-style: bold;
+        overflow-x: hidden;
+    }
+    """
+    
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("p", "toggle_pause", "Pause/Resume"),
+        ("f", "force_scan", "Force Scan"),
+        ("c", "edit_config", "Edit Config"),
+        ("h", "toggle_history", "Toggle History"),
+        ("d", "cancel_task", "Cancel Selected"),
+        ("u", "prioritize_task", "Prioritize Selected"),
+        ("r", "retry_task", "Retry Selected"),
+    ]
+    
     def __init__(self, plex_url, config, log_handler):
+        super().__init__()
         self.plex_url = plex_url
         self.config = config
         self.log_handler = log_handler
-        self.console = Console()
         self.start_time = time.time()
-        
-        # In-memory registry of caching tasks
-        # keyed by file_path
-        self.caching_tasks = {}
-        
-        # Last fetched session data
-        self.active_sessions = []
         self.mount_healthy = True
-        self.selected_task_index = 0
+        self.show_history = False
         
-        self.layout = self._create_layout()
+        self.active_sessions = []
         
-    def _create_layout(self) -> Layout:
+    def compose(self) -> ComposeResult:
+        yield Label("BingeSentry Status Dashboard Loading...", id="header")
+        with Container(id="body"):
+            yield HoverDataTable(id="sessions_table")
+            yield HoverDataTable(id="queue_table")
+        yield RichLog(id="logs_panel", markup=True, highlight=True, max_lines=500)
+        yield Label("Controls ➔ Q: Quit | P: Pause/Resume Scanner | F: Force Scan | C: Edit Config | H: Toggle History | D: Cancel Task | U: Prioritize | R: Retry", id="controls")
+
+    def on_mount(self):
+        # Initialize tables
+        sessions_table = self.query_one("#sessions_table", HoverDataTable)
+        sessions_table.border_title = "Active Plex Playback Sessions"
+        sessions_table.add_columns("User", "Type", "Title / Playing Media", "Progress", "Next Cache Target")
+        
+        queue_table = self.query_one("#queue_table", HoverDataTable)
+        queue_table.border_title = "Rclone Cache Queue"
+        queue_table.add_columns("File Name", "Size", "PID", "Status", "Elapsed")
+        queue_table.cursor_type = "row"
+        queue_table.show_cursor = True
+        queue_table.focus()
+        
+        # Populate early logs from handler
+        log_widget = self.query_one("#logs_panel", RichLog)
+        for log in self.log_handler.logs:
+            log_widget.write(log)
+            
+        # Bind log widget to textual log handler
+        self.textual_log_handler = TextualLogHandler(log_widget)
+        logging.getLogger().addHandler(self.textual_log_handler)
+        
+        # Remove the early memory log handler to prevent duplicate formatting overhead
+        logging.getLogger().removeHandler(self.log_handler)
+        
+        # Start intervals
+        self.set_interval(0.5, self.check_trigger_event)
+        self.set_interval(1.0, self.refresh_dashboard)
+        self.set_interval(1.0, self.update_system_stats)
+        self.set_interval(10.0, self.trigger_periodic_scan)
+
+    def trigger_periodic_scan(self):
         """
-        Builds the 3-section layout: Header, Body (Split), and Footer (Logs).
+        Periodically wakes up the scanner to check queue status and processes even when Plex is silent.
         """
-        layout = Layout()
-        
-        # Main split
-        layout.split(
-            Layout(name="header", size=4),
-            Layout(name="body", ratio=1),
-            Layout(name="footer", size=12)
-        )
-        
-        # Body split
-        layout["body"].split_row(
-            Layout(name="sessions", ratio=3),
-            Layout(name="cache_queue", ratio=2)
-        )
-        
-        return layout
-        
-    def add_cache_task(self, file_path, size_gb, pid, cmd):
-        """
-        Registers a new active caching task.
-        """
-        self.caching_tasks[file_path] = CachingTask(file_path, size_gb, pid, cmd)
-        
-    def update_task_statuses(self):
-        """
-        Scans registered tasks to see if their background process PIDs are still active.
-        """
-        for task in self.caching_tasks.values():
-            if task.status == "Caching":
-                try:
-                    proc = psutil.Process(task.pid)
-                    # Check if it has completed or turned into a zombie
-                    if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
-                        task.status = "Completed"
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    # If process doesn't exist, assume completed
-                    task.status = "Completed"
-                    
+        if self.scan_trigger_event:
+            self._is_periodic_scan = True
+            self.scan_trigger_event.set()
     def update_sessions(self, sessions):
-        """
-        Updates the internal cache of active Plex sessions.
-        """
         self.active_sessions = sessions
-        
-    def _render_header(self, is_paused=False) -> Panel:
+
+    def check_trigger_event(self):
+        if self.scan_trigger_event and self.scan_trigger_event.is_set():
+            self.scan_trigger_event.clear()
+            is_periodic = getattr(self, '_is_periodic_scan', False)
+            self._is_periodic_scan = False
+            self.run_plex_scan(force=not is_periodic)
+
+    @work(thread=True)
+    def run_plex_scan(self, force=False):
         """
-        Renders the TUI top banner.
+        Runs the Plex scan in a background thread to prevent UI freezing.
         """
+        try:
+            mount_dir = self.config.rclone_mount_dir or self.config.path_map_to
+            self.mount_healthy = is_mount_responsive(mount_dir) if mount_dir else True
+            
+            if self.mount_healthy:
+                self.fetch_sessions_func(self.conn_manager, self.config, self.queue_manager, self, force=force)
+            else:
+                logging.error(f"Mount Health Guard: Mount directory '{mount_dir}' is unresponsive or disconnected! Suspending caching queue.")
+                self.queue_manager.handle_buffering_guard(any_user_buffering=True)
+        except Exception as e:
+            logging.error(f"Error querying Plex sessions in TUI: {e}")
+
+    def update_system_stats(self):
         uptime_secs = int(time.time() - self.start_time)
         hours, remainder = divmod(uptime_secs, 3600)
         minutes, seconds = divmod(remainder, 60)
         uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         
-        # Gather quick system stats
-        cpu_usage = psutil.cpu_percent()
+        cpu_usage = get_cpu_percent()
         mem_usage = psutil.virtual_memory().percent
         
-        grid = Table.grid(expand=True)
-        grid.add_column(justify="left", ratio=2)
-        grid.add_column(justify="center", ratio=1)
-        grid.add_column(justify="right", ratio=2)
-        
-        status_text = "[bold yellow](PAUSED)[/bold yellow]" if is_paused else "[bold green](ONLINE)[/bold green]"
-        if not getattr(self, 'mount_healthy', True):
+        status_text = "[bold yellow](PAUSED)[/bold yellow]" if getattr(self, 'is_paused', False) else "[bold green](ONLINE)[/bold green]"
+        if not self.mount_healthy:
             status_text = "[bold blink red](MOUNT OFFLINE)[/bold blink red]"
-        elif not getattr(self, 'conn_manager', None) or not self.conn_manager.plex:
+        elif not self.conn_manager or not self.conn_manager.plex:
             status_text = "[bold blink red](PLEX OFFLINE)[/bold blink red]"
-        grid.add_row(
-            Text.from_markup(f"[bold magenta]BingeSentry[/bold magenta] ➔ [cyan]{self.plex_url}[/cyan] {status_text}"),
-            Text.from_markup(f"[bold white]CPU:[/bold white] [yellow]{cpu_usage}%[/yellow] | [bold white]MEM:[/bold white] [yellow]{mem_usage}%[/yellow]"),
-            Text.from_markup(f"[bold white]Uptime:[/bold white] [cyan]{uptime_str}[/cyan] | [bold white]Time:[/bold white] {datetime.now().strftime('%H:%M:%S')}")
+            
+        # Get mount free space if possible
+        mount_dir = self.config.rclone_mount_dir or self.config.path_map_to
+        disk_str = ""
+        if self.mount_healthy and mount_dir:
+            try:
+                from disk import has_enough_disk_space
+                _, free_space_gb = has_enough_disk_space(mount_dir, 0.0)
+                if free_space_gb > 0:
+                    disk_str = f" | Disk: {free_space_gb:.1f} GB free"
+            except Exception:
+                pass
+
+        # Get bandwidth stats
+        saved_str = ""
+        try:
+            from disk import get_bandwidth_stats
+            stats = get_bandwidth_stats()
+            saved_gb = stats.get("total_saved_bytes", 0) / (1024 ** 3)
+            if saved_gb > 0:
+                saved_str = f" | Saved: {saved_gb:.1f} GB"
+        except Exception:
+            pass
+
+        header = self.query_one("#header", Label)
+        header.update(
+            f"BingeSentry ➔ {self.plex_url} {status_text} | "
+            f"CPU: {cpu_usage}% | MEM: {mem_usage}%{disk_str}{saved_str} | "
+            f"Uptime: {uptime_str} | Time: {datetime.now().strftime('%H:%M:%S')}"
         )
-        
-        return Panel(
-            grid,
-            box=ROUNDED,
-            title="[bold yellow]System Status[/bold yellow]",
-            border_style="magenta"
-        )
-        
-    def _render_sessions(self, queue_manager) -> Panel:
-        """
-        Renders the active Plex session table.
-        """
-        table = Table(
-            expand=True,
-            box=ROUNDED,
-            border_style="cyan"
-        )
-        
-        table.add_column("User", style="cyan", width=15)
-        table.add_column("Type", style="yellow", width=8)
-        table.add_column("Title / Playing Media", style="white", ratio=3)
-        table.add_column("Progress", style="magenta", width=12)
-        table.add_column("Next Cache Target", style="green", ratio=3)
+
+    def refresh_dashboard(self):
+        self.refresh_sessions_table()
+        self.refresh_queue_table()
+
+    def refresh_sessions_table(self):
+        table = self.query_one("#sessions_table", HoverDataTable)
+        table.clear(columns=True)
+        table.add_columns("User", "Type", "Title / Playing Media", "Progress", "Next Cache Target")
         
         if not self.active_sessions:
-            table.add_row(
-                Text("No sessions", style="dim italic"),
-                "-",
-                Text("No active playback sessions on Plex.", style="dim italic"),
-                "-",
-                "-"
-            )
-        else:
-            for session in self.active_sessions:
-                user = session.usernames[0] if session.usernames else "Unknown"
-                
-                # Check media type
-                if session.type == "episode":
-                    show = session.grandparentTitle
-                    season_num = session.parentIndex
-                    episode_num = session.index
-                    title = f"{show} (S{season_num}E{episode_num})"
-                    
-                    # Try to fetch current playback offset/percentage
-                    duration = getattr(session, 'duration', 0)
-                    view_offset = getattr(session, 'viewOffset', 0)
-                    pct = int((view_offset / duration) * 100) if duration > 0 else 0
-                    progress = f"{pct}%" if duration > 0 else "Playing"
-                        
-                    # Find cached target
-                    next_cache = "Resolving next..."
-                    # Find if we cached or are caching any files for this show
-                    # We can lookup by looking at what we mapped
-                    # For TUI we will calculate this dynamically in the refresh cycle
-                    if hasattr(session, '_next_cache_file'):
-                        file_path = session._next_cache_file
-                        filename = os.path.basename(file_path)
-                        
-                        if getattr(session, '_cache_threshold_waiting', False):
-                            thresh = getattr(session, '_cache_threshold_val', 0)
-                            next_cache = f"{filename} [bold yellow](deferred: {pct}%/{thresh}%)[/bold yellow]"
-                        else:
-                            # Get cache status
-                            is_cached, cached_pct, _, _ = get_cache_status(
-                                file_path,
-                                self.config.rclone_cache_dir,
-                                self.config.rclone_remote_name,
-                                self.config.rclone_mount_dir or self.config.path_map_to
-                            )
-                            
-                            if is_cached:
-                                next_cache = f"{filename} [bold green](100%)[/bold green]"
-                            elif cached_pct > 0:
-                                next_cache = f"{filename} [bold yellow]({cached_pct:.1f}%)[/bold yellow]"
-                            else:
-                                if file_path in queue_manager.tasks:
-                                    task = queue_manager.tasks[file_path]
-                                    if task.status == "Pending":
-                                        next_cache = f"{filename} [dim cyan](queued)[/dim cyan]"
-                                    elif "Paused" in task.status or task.status == "Paused":
-                                        reason = task.status.replace("Paused", "").strip(" ()")
-                                        reason = reason if reason else "buffering"
-                                        style = "red" if "Failed" in task.status else "yellow"
-                                        next_cache = f"{filename} [bold {style}](paused: {reason})[/bold {style}]"
-                                    else:
-                                        next_cache = f"{filename} [bold green](caching...)[/bold green]"
-                                else:
-                                    next_cache = f"{filename} [red](not cached)[/red]"
-                    else:
-                        next_cache = "None / Finished"
-                        
-                    table.add_row(user, "TV Show", title, progress, next_cache)
-                else:
-                    movie_title = getattr(session, 'title', 'Unknown Movie')
-                    progress = "Playing"
-                    duration = getattr(session, 'duration', 0)
-                    view_offset = getattr(session, 'viewOffset', 0)
-                    if duration > 0:
-                        pct = int((view_offset / duration) * 100)
-                        progress = f"{pct}%"
-                    table.add_row(user, "Movie", movie_title, progress, "[dim]- (No cache required)[/dim]")
-                    
-        return Panel(
-            table,
-            box=ROUNDED,
-            title="[bold cyan]Active Plex Playback Sessions[/bold cyan]",
-            border_style="cyan"
-        )
-        
-    def _render_cache_queue(self, queue_manager) -> Panel:
-        """
-        Renders the sequential caching queue.
-        """
-        table = Table(
-            expand=True,
-            box=ROUNDED,
-            border_style="green"
-        )
-        
-        table.add_column("File Name", style="white", ratio=3)
-        table.add_column("Size", style="yellow", width=8)
-        table.add_column("PID", style="magenta", width=8)
-        table.add_column("Status", width=18)
-        table.add_column("Elapsed", style="cyan", width=10)
-        
-        # Sort queue manager tasks: Caching/Paused first, then pending by priority score descending
-        sorted_tasks = sorted(
-            queue_manager.tasks.values(),
-            key=lambda t: (t.status in ("Caching", "Paused"), t.priority_score if t.status == "Pending" else -9999, t.start_time or 0),
-            reverse=True
-        )
-        
-        if not sorted_tasks:
-            table.add_row(
-                Text("No caching tasks", style="dim italic"),
-                "-",
-                "-",
-                Text("Idle", style="dim green"),
-                "-"
-            )
-        else:
-            # Clamp selection index dynamically to prevent list errors
-            self.selected_task_index = max(0, min(self.selected_task_index, len(sorted_tasks) - 1))
+            table.add_row("No active sessions on Plex.", "-", "-", "-", "-")
+            return
             
-            for idx, task in enumerate(sorted_tasks[:10]):
-                filename = os.path.basename(task.file_path)
+        from main import map_path, resolve_existing_path
+        for session in self.active_sessions:
+            user = session.usernames[0] if session.usernames else "Unknown"
+            if session.type == "episode":
+                show = session.grandparentTitle
+                season_num = session.parentIndex
+                episode_num = session.index
+                title = f"{show} (S{season_num}E{episode_num})"
+                title_truncated = truncate_text(title, 32)
+                
+                duration = getattr(session, 'duration', 0)
+                view_offset = getattr(session, 'viewOffset', 0)
+                pct = int((view_offset / duration) * 100) if duration > 0 else 0
+                progress = f"{pct}%" if duration > 0 else "Playing"
+                
+                next_cache = "Resolving..."
+                file_path = getattr(session, '_next_cache_file', None)
+                if getattr(session, '_cache_filtered', False):
+                    next_cache = "[yellow]Filtered (User/Library)[/yellow]"
+                elif getattr(session, '_end_of_show', False):
+                    next_cache = "[green]End of Show[/green]"
+                elif getattr(session, '_next_cache_file', None) is not None:
+                    filename = truncate_path(file_path, 32)
+                    
+                    if getattr(session, '_cache_threshold_waiting', False):
+                        thresh = getattr(session, '_cache_threshold_val', 0)
+                        next_cache = f"{filename} [yellow](deferred: {pct}%/{thresh}%)[/yellow]"
+                    else:
+                        is_cached, cached_pct, _, _ = get_cache_status(
+                            file_path,
+                            self.config.rclone_cache_dir,
+                            self.config.rclone_remote_name,
+                            self.config.rclone_mount_dir or self.config.path_map_to
+                        )
+                        if is_cached:
+                            next_cache = f"{filename} [green](100%)[/green]"
+                        elif cached_pct > 0:
+                            next_cache = f"{filename} [yellow]({cached_pct:.1f}%)[/yellow]"
+                        else:
+                            task = self.queue_manager.get_task(file_path)
+                            if task:
+                                if task.status == "Pending":
+                                    next_cache = f"{filename} [cyan](queued)[/cyan]"
+                                elif "Paused" in task.status or task.status == "Paused":
+                                    reason = task.status.replace("Paused", "").strip(" ()")
+                                    reason = reason if reason else "buffering"
+                                    style = "red" if "Failed" in task.status else "yellow"
+                                    next_cache = f"{filename} [{style}](paused: {reason})[/{style}]"
+                                else:
+                                    next_cache = f"{filename} [green](caching...)[/green]"
+                            else:
+                                next_cache = f"{filename} [red](not cached)[/red]"
+                else:
+                    next_cache = "None / Finished"
+                
+                playing_file = None
+                try:
+                    raw_path = session.media[0].parts[0].file
+                    playing_file = map_path(raw_path, self.config.path_map_from, self.config.path_map_to)
+                    playing_file = resolve_existing_path(playing_file)
+                except Exception:
+                    pass
+                row_key = file_path or playing_file
+                table.add_row(user, "TV Show", title_truncated, progress, next_cache, key=row_key)
+            else:
+                movie_title = getattr(session, 'title', 'Unknown Movie')
+                movie_title_truncated = truncate_text(movie_title, 32)
+                progress = "Playing"
+                duration = getattr(session, 'duration', 0)
+                view_offset = getattr(session, 'viewOffset', 0)
+                if duration > 0:
+                    pct = int((view_offset / duration) * 100)
+                    progress = f"{pct}%"
+                    
+                movie_file = None
+                try:
+                    raw_path = session.media[0].parts[0].file
+                    movie_file = map_path(raw_path, self.config.path_map_from, self.config.path_map_to)
+                    movie_file = resolve_existing_path(movie_file)
+                except Exception:
+                    pass
+                table.add_row(user, "Movie", movie_title_truncated, progress, "- (No cache required)", key=movie_file)
+
+    def refresh_queue_table(self):
+        table = self.query_one("#queue_table", HoverDataTable)
+        all_tasks = self.queue_manager.get_all_tasks()
+        
+        saved_key = None
+        if table.cursor_row is not None:
+            try:
+                saved_key = get_row_key(table, table.cursor_row)
+            except Exception:
+                pass
+                
+        table.clear(columns=True)
+        
+        if getattr(self, 'show_history', False):
+            table.add_columns("File Name", "Size", "Status", "Completed At")
+            
+            history_tasks = [t for t in all_tasks if t.status in ("Completed", "Paused (Error)", "Paused (Failed)")]
+            history_tasks.sort(key=lambda t: t.finished_time or 0, reverse=True)
+            
+            if not history_tasks:
+                table.add_row("No caching history found.", "-", "-", "-")
+                return
+                
+            for task in history_tasks[:15]:
+                filename = truncate_path(task.file_path, 32)
                 size_str = f"{task.size_gb:.2f} GB" if task.size_gb > 0 else "Unknown"
                 
-                is_selected = (idx == self.selected_task_index)
-                prefix = "➔ " if is_selected else "  "
-                filename_text = Text(f"{prefix}{filename}", style="bold cyan" if is_selected else "white")
+                status_style = "green" if task.status == "Completed" else "red"
+                status_text = f"[{status_style}]{task.status}[/{status_style}]"
+                
+                finished_at = "-"
+                if task.finished_time:
+                    finished_at = datetime.fromtimestamp(task.finished_time).strftime('%H:%M:%S')
+                    
+                table.add_row(filename, size_str, status_text, finished_at, key=task.file_path)
+        else:
+            table.add_columns("File Name", "Size", "PID", "Status", "Elapsed")
+            
+            active_tasks = [t for t in all_tasks if t.status not in ("Completed", "Paused (Error)", "Paused (Failed)")]
+            
+            sorted_tasks = sorted(
+                active_tasks,
+                key=lambda t: (t.status in ("Caching", "Paused") or t.status.startswith("Paused"), t.priority_score if t.status == "Pending" else -9999, t.start_time or 0),
+                reverse=True
+            )
+            
+            if not sorted_tasks:
+                table.add_row("No caching tasks in queue.", "-", "-", "Idle", "-")
+                return
+                
+            for task in sorted_tasks[:10]:
+                filename = truncate_path(task.file_path, 32)
+                size_str = f"{task.size_gb:.2f} GB" if task.size_gb > 0 else "Unknown"
                 
                 if task.status == "Caching":
                     is_cached, cached_pct, cached_bytes, total_bytes = get_cache_status(
@@ -339,179 +631,140 @@ class TUIDashboard:
                         self.config.rclone_mount_dir or self.config.path_map_to
                     )
                     if is_cached:
-                        task.status = "Completed"
-                        status_text = Text("Completed", style="bold green")
+                        status_text = "[green]Completed[/green]"
                         elapsed = "Finished"
                     else:
-                        cached_gb = cached_bytes / (1024 ** 3)
-                        total_gb = total_bytes / (1024 ** 3) if total_bytes > 0 else task.size_gb
-                        status_text = Text(f"Caching ({cached_gb:.2f} GB / {total_gb:.2f} GB {cached_pct:.1f}%)", style="bold blink yellow" if cached_pct > 0 else "bold blink green")
+                        # Calculate caching speed and ETA
+                        current_time = time.time()
+                        if task.last_cached_bytes is not None and task.last_speed_check_time is not None:
+                            elapsed_time = current_time - task.last_speed_check_time
+                            if elapsed_time >= 0.5:
+                                bytes_diff = cached_bytes - task.last_cached_bytes
+                                if bytes_diff >= 0:
+                                    instant_speed = bytes_diff / elapsed_time
+                                    # Smooth speed updates using Exponential Moving Average (EMA)
+                                    task.current_speed_bps = 0.7 * task.current_speed_bps + 0.3 * instant_speed
+                                task.last_cached_bytes = cached_bytes
+                                task.last_speed_check_time = current_time
+                        else:
+                            task.last_cached_bytes = cached_bytes
+                            task.last_speed_check_time = current_time
+                            task.current_speed_bps = 0.0
+
+                        speed_mb = task.current_speed_bps / (1024 * 1024)
+                        speed_str = f"{speed_mb:.1f} MB/s" if speed_mb > 0.05 else "0.0 MB/s"
+                        
+                        if task.current_speed_bps > 1024:
+                            eta_secs = int((total_bytes - cached_bytes) / task.current_speed_bps)
+                            if eta_secs > 3600:
+                                eta_str = f"{eta_secs // 3600}h {(eta_secs % 3600) // 60}m"
+                            elif eta_secs > 60:
+                                eta_str = f"{eta_secs // 60}m {eta_secs % 60}s"
+                            else:
+                                eta_str = f"{eta_secs}s"
+                        else:
+                            eta_str = "--"
+
+                        status_text = f"[yellow]Caching {cached_pct:.1f}%[/yellow] ({speed_str}, ETA: {eta_str})"
                         elapsed = f"{task.get_elapsed_time()}s"
                 elif task.status.startswith("Paused") or task.status == "Paused":
-                    style = "bold red" if "Failed" in task.status else "bold yellow"
-                    # Handle legacy Paused status representation
+                    task.last_cached_bytes = None
+                    task.last_speed_check_time = None
+                    task.current_speed_bps = 0.0
+                    style = "red" if "Failed" in task.status or "Error" in task.status else "yellow"
                     disp_status = "Paused (buffering)" if task.status == "Paused" else task.status
-                    status_text = Text(disp_status, style=style)
+                    status_text = f"[{style}]{disp_status}[/{style}]"
                     elapsed = f"{task.get_elapsed_time()}s" if task.start_time else "-"
                 elif task.status == "Pending":
                     offset_val = getattr(task, 'offset', 1)
-                    status_text = Text(f"Pending (+{offset_val} ep, {task.progress_pct:.0f}%)", style="dim cyan")
+                    status_text = f"[cyan]Pending (+{offset_val} ep, {task.progress_pct:.0f}%)[/cyan]"
                     elapsed = "-"
                 elif task.status == "Completed":
-                    status_text = Text("Completed", style="bold green")
+                    status_text = "[green]Completed[/green]"
                     elapsed = "Finished"
                 else:
-                    status_text = Text(task.status, style="bold red")
+                    status_text = f"[red]{task.status}[/red]"
                     elapsed = "Finished"
                     
-                table.add_row(filename_text, size_str, str(task.pid), status_text, elapsed)
-                
-        return Panel(
-            table,
-            box=ROUNDED,
-            title="[bold green]Rclone Cache Queue (Recent 10 Tasks)[/bold green]",
-            border_style="green"
-        )
-        
-    def _render_logs(self) -> Panel:
-        """
-        Renders scrollable log buffer.
-        """
-        log_text = self.log_handler.get_logs()
-        controls_text = (
-            "\n[bold yellow]Global Controls:[/bold yellow] [bold white]Q[/bold white] Quit | [bold white]P[/bold white] Pause/Resume Scanner | [bold white]F[/bold white] Force Scan"
-            "\n[bold yellow]Queue Controls:[/bold yellow] [bold white]W/S[/bold white] or [bold white]K/J[/bold white] Navigate | [bold white]U[/bold white] Bump Priority | [bold white]D[/bold white] Cancel Task | [bold white]R[/bold white] Retry Task"
-        )
-        return Panel(
-            f"{log_text}\n{controls_text}",
-            box=ROUNDED,
-            title="[bold white]Live Application Logs[/bold white]",
-            border_style="white"
-        )
-        
-    def update_view(self, queue_manager, is_paused=False):
-        """
-        Updates the TUI widgets dynamically.
-        """
-        # status updates are handled by queue manager
-        self.layout["header"].update(self._render_header(is_paused))
-        self.layout["sessions"].update(self._render_sessions(queue_manager))
-        self.layout["cache_queue"].update(self._render_cache_queue(queue_manager))
-        self.layout["footer"].update(self._render_logs())
-        
-    def run_loop(self, conn_manager, queue_manager, fetch_sessions_func, scan_trigger_event=None):
-        """
-        Runs the main loop under Rich Live control.
-        """
-        self.conn_manager = conn_manager
-        self.console.clear()
-        
-        is_paused = False
-        initial_fetch = True
-        
-        # Start the non-blocking keyboard listener
-        listener = KeyListener()
-        listener.start()
-        
-        with Live(self.layout, console=self.console, screen=True, refresh_per_second=2) as live:
+                table.add_row(filename, size_str, str(task.pid), status_text, elapsed, key=task.file_path)
+            
+        if saved_key:
             try:
-                while True:
-                    current_time = time.time()
-                    
-                    # Fetch sorted tasks to allow navigation and selected operations
-                    sorted_tasks = sorted(
-                        queue_manager.tasks.values(),
-                        key=lambda t: (t.status in ("Caching", "Paused"), t.priority_score if t.status == "Pending" else -9999, t.start_time or 0),
-                        reverse=True
-                    )
-                    
-                    # Non-blocking read of keyboard inputs
-                    key = listener.get_key()
-                    if key:
-                        key = key.lower()
-                        if key == 'q':
-                            break
-                        elif key == 'p':
-                            is_paused = not is_paused
-                            logging.info(f"TUI: Scanner {'PAUSED' if is_paused else 'RESUMED'}.")
-                        elif key == 'f':
-                            logging.info("TUI: Forcing immediate playback scan...")
-                            if scan_trigger_event:
-                                scan_trigger_event.set()
-                        elif key in ('k', 'w'):
-                            if sorted_tasks:
-                                self.selected_task_index = max(0, self.selected_task_index - 1)
-                        elif key in ('j', 's'):
-                            if sorted_tasks:
-                                self.selected_task_index = min(len(sorted_tasks) - 1, self.selected_task_index + 1)
-                        elif key == 'd':
-                            if sorted_tasks and 0 <= self.selected_task_index < len(sorted_tasks):
-                                target_task = sorted_tasks[self.selected_task_index]
-                                if target_task.process:
-                                    try:
-                                        target_task.process.terminate()
-                                        target_task.process.wait(timeout=1)
-                                    except Exception:
-                                        pass
-                                if queue_manager.active_task_path == target_task.file_path:
-                                    queue_manager.active_task_path = None
-                                    queue_manager.is_suspended = False
-                                if target_task.file_path in queue_manager.tasks:
-                                    del queue_manager.tasks[target_task.file_path]
-                                logging.info(f"TUI Queue Control: Canceled caching for '{os.path.basename(target_task.file_path)}'")
-                                self.selected_task_index = max(0, self.selected_task_index - 1)
-                        elif key == 'u':
-                            if sorted_tasks and 0 <= self.selected_task_index < len(sorted_tasks):
-                                target_task = sorted_tasks[self.selected_task_index]
-                                if target_task.status == "Pending":
-                                    target_task.priority_score = 999999
-                                    logging.info(f"TUI Queue Control: Prioritized '{os.path.basename(target_task.file_path)}' to the top of the queue.")
-                        elif key == 'r':
-                            if sorted_tasks and 0 <= self.selected_task_index < len(sorted_tasks):
-                                target_task = sorted_tasks[self.selected_task_index]
-                                target_task.status = "Pending"
-                                target_task.retry_count = 0
-                                target_task.process = None
-                                target_task.start_time = None
-                                target_task.pid = "-"
-                                logging.info(f"TUI Queue Control: Reset and retried task '{os.path.basename(target_task.file_path)}'")
-                    
-                    # Check for event triggers (WebSocket Alerts)
-                    event_triggered = False
-                    if scan_trigger_event and scan_trigger_event.is_set():
-                        event_triggered = True
-                        scan_trigger_event.clear()
-                        logging.info("TUI: WebSocket trigger event received. Fetching sessions immediately...")
-                        
-                    # Plex API Call (only if scanner is not paused, triggered by WebSocket events)
-                    should_poll = False
-                    if not is_paused:
-                        if event_triggered or initial_fetch:
-                            should_poll = True
-                            initial_fetch = False
-                            
-                    if should_poll:
-                        try:
-                            # Verify mount health first
-                            mount_dir = self.config.rclone_mount_dir or self.config.path_map_to
-                            self.mount_healthy = is_mount_responsive(mount_dir) if mount_dir else True
-                            
-                            if self.mount_healthy:
-                                # Execute standard caching flow (updates sessions inside the callback)
-                                fetch_sessions_func(self.conn_manager, self.config, queue_manager, self)
-                            else:
-                                logging.error(f"Mount Health Guard: Mount directory '{mount_dir}' is unresponsive or disconnected! Suspending caching queue.")
-                                queue_manager.handle_buffering_guard(any_user_buffering=True)
-                        except Exception as e:
-                            logging.error(f"Error querying Plex sessions in TUI: {e}")
-                        
-                    # Update screen
-                    self.update_view(queue_manager, is_paused)
-                    # Use smaller sleep interval for snappy keyboard input detection
-                    time.sleep(0.1)
-            except KeyboardInterrupt:
+                table.cursor_coordinate = Coordinate(table.get_row_index(saved_key), 0)
+            except Exception:
                 pass
-            finally:
-                listener.stop()
-                self.console.clear()
-                self.console.print("[bold yellow]TUI Dashboard shut down. Good bye![/bold yellow]")
+
+    def action_toggle_history(self):
+        self.show_history = not getattr(self, 'show_history', False)
+        # Update table border title
+        queue_table = self.query_one("#queue_table", HoverDataTable)
+        if self.show_history:
+            queue_table.border_title = "Completed Caching History"
+        else:
+            queue_table.border_title = "Rclone Cache Queue"
+        logging.info(f"TUI: Toggled view to {'History' if self.show_history else 'Queue'}.")
+        self.refresh_dashboard()
+
+    def action_edit_config(self):
+        def handle_config_edit_result(result):
+            if result:
+                self.refresh_dashboard()
+        self.push_screen(ConfigEditScreen(self.config), handle_config_edit_result)
+
+    def action_toggle_pause(self):
+        self.is_paused = not getattr(self, 'is_paused', False)
+        logging.info(f"TUI: Scanner {'PAUSED' if self.is_paused else 'RESUMED'}.")
+
+    def action_force_scan(self):
+        logging.info("TUI: Forcing immediate playback scan...")
+        if self.scan_trigger_event:
+            self._is_periodic_scan = False
+            self.scan_trigger_event.set()
+
+    def action_cancel_task(self):
+        table = self.query_one("#queue_table", HoverDataTable)
+        if table.cursor_row is not None:
+            try:
+                row_key = get_row_key(table, table.cursor_row)
+                if row_key and row_key.value:
+                    file_path = row_key.value
+                    if self.queue_manager.cancel_task(file_path):
+                        logging.info(f"TUI Queue Control: Canceled caching for '{os.path.basename(file_path)}'")
+                        self.refresh_dashboard()
+            except Exception as e:
+                logging.debug(f"TUI Queue Control Error: {e}")
+
+    def action_prioritize_task(self):
+        table = self.query_one("#queue_table", HoverDataTable)
+        if table.cursor_row is not None:
+            try:
+                row_key = get_row_key(table, table.cursor_row)
+                if row_key and row_key.value:
+                    file_path = row_key.value
+                    if self.queue_manager.prioritize_task(file_path):
+                        logging.info(f"TUI Queue Control: Prioritized '{os.path.basename(file_path)}' to the top of the queue.")
+                        self.refresh_dashboard()
+            except Exception as e:
+                logging.debug(f"TUI Queue Control Error: {e}")
+
+    def action_retry_task(self):
+        table = self.query_one("#queue_table", HoverDataTable)
+        if table.cursor_row is not None:
+            try:
+                row_key = get_row_key(table, table.cursor_row)
+                if row_key and row_key.value:
+                    file_path = row_key.value
+                    if self.queue_manager.retry_task(file_path):
+                        logging.info(f"TUI Queue Control: Reset and retried task '{os.path.basename(file_path)}'")
+                        self.refresh_dashboard()
+            except Exception as e:
+                logging.debug(f"TUI Queue Control Error: {e}")
+
+    def run_loop(self, conn_manager, queue_manager, fetch_sessions_func, scan_trigger_event=None):
+        self.conn_manager = conn_manager
+        self.queue_manager = queue_manager
+        self.fetch_sessions_func = fetch_sessions_func
+        self.scan_trigger_event = scan_trigger_event
+        
+        # Start Textual Event Loop
+        self.run()

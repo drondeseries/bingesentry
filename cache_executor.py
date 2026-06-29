@@ -52,6 +52,7 @@ class DynamicThrottler:
         self.throttle_speed_bps = throttle_speed_mb * 1024 * 1024
         self.last_check_time = 0
         self.is_active_streams = False
+        self.plex = None
         
     def check_throttle(self):
         """
@@ -65,9 +66,10 @@ class DynamicThrottler:
         if current_time - self.last_check_time >= 10:
             self.last_check_time = current_time
             try:
-                from plexapi.server import PlexServer
-                plex = PlexServer(self.plex_url, self.plex_token)
-                sessions = plex.sessions()
+                if not self.plex:
+                    from plexapi.server import PlexServer
+                    self.plex = PlexServer(self.plex_url, self.plex_token, timeout=10.0)
+                sessions = self.plex.sessions()
                 self.is_active_streams = len(sessions) > 0
                 if self.is_active_streams:
                     logging.info(f"Active streams detected. Throttling caching speed to {self.throttle_speed_bps / (1024*1024):.1f} MB/s.")
@@ -76,6 +78,7 @@ class DynamicThrottler:
             except Exception as e:
                 # If query fails, fallback to previous state to avoid interruption
                 logging.debug(f"Plex session query failed: {e}")
+                self.plex = None
                 
         if self.is_active_streams:
             return self.throttle_speed_bps
@@ -89,6 +92,14 @@ def main():
     config = Config()
     setup_executor_logging(config)
     
+    # Enforce mount health check before proceeding
+    mount_dir = config.rclone_mount_dir or config.path_map_to
+    if mount_dir:
+        from disk import is_mount_responsive
+        if not is_mount_responsive(mount_dir):
+            logging.error(f"Mount Health Guard: Mount directory '{mount_dir}' is unresponsive or offline. Aborting executor.")
+            sys.exit(2)
+            
     file_path = args.file
     filename = os.path.basename(file_path)
     
@@ -118,8 +129,13 @@ def main():
         file_path_abs = os.path.abspath(file_path_real)
         mount_dir_abs = os.path.abspath(mount_dir_real)
         
-        if file_path_abs.startswith(mount_dir_abs):
+        try:
             relative_path = os.path.relpath(file_path_abs, mount_dir_abs)
+            is_inside = not relative_path.startswith('..') and not os.path.isabs(relative_path)
+        except ValueError:
+            is_inside = False
+
+        if is_inside:
             meta_file_path = os.path.join(cache_dir, 'vfsMeta', remote_name, relative_path)
             
             if os.path.exists(meta_file_path):
@@ -149,6 +165,11 @@ def main():
     gaps = [g for g in gaps if g[1] > g[0]]
     if not gaps:
         logging.info(f"File '{filename}' is already 100% cached. Exiting.")
+        try:
+            from disk import update_bandwidth_stats
+            update_bandwidth_stats(total_size, 0)
+        except Exception:
+            pass
         sys.exit(0)
         
     # Read chunk size in bytes
@@ -189,6 +210,11 @@ def main():
                             time.sleep(target_duration - elapsed)
                             
         logging.info(f"Smart cache completed. Read {total_read_bytes / (1024*1024):.2f} MB of uncached data.")
+        try:
+            from disk import update_bandwidth_stats
+            update_bandwidth_stats(max(0, total_size - total_read_bytes), total_read_bytes)
+        except Exception:
+            pass
         sys.exit(0)
     except OSError as e:
         logging.error(f"I/O error during cache reading for '{filename}': {e}")

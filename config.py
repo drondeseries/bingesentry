@@ -27,7 +27,8 @@ class Config:
             try:
                 if val_type == bool:
                     return val.lower() in ('true', '1', 't', 'y', 'yes')
-                return val_type(val)
+                val_res = val_type(val)
+                return val_res.strip() if isinstance(val_res, str) else val_res
             except ValueError:
                 pass
                 
@@ -40,12 +41,13 @@ class Config:
                     return self.config.getint(section, option)
                 elif val_type == float:
                     return self.config.getfloat(section, option)
-                return self.config.get(section, option)
+                val_res = self.config.get(section, option)
+                return val_res.strip() if isinstance(val_res, str) else val_res
             except Exception:
                 pass
                 
         # 3. Fallback to default value
-        return default
+        return default.strip() if isinstance(default, str) else default
 
     @property
     def plex_url(self):
@@ -69,7 +71,7 @@ class Config:
 
     @property
     def cache_command(self):
-        return self._get_val('Cache', 'CACHE_COMMAND', 'CACHE_COMMAND', 'rclone md5sum {file_path}')
+        return self._get_val('Cache', 'CACHE_COMMAND', 'CACHE_COMMAND', 'python cache_executor.py --file {file_path}')
 
     @property
     def min_free_space_gb(self):
@@ -116,4 +118,42 @@ class Config:
     @property
     def max_cache_total_gb(self):
         return self._get_val('Cache', 'MAX_CACHE_TOTAL_GB', 'MAX_CACHE_TOTAL_GB', 0.0, float)
+
+    @property
+    def max_concurrent_caches(self):
+        return self._get_val('Cache', 'MAX_CONCURRENT_CACHES', 'MAX_CONCURRENT_CACHES', 1, int)
+
+    def _get_list(self, section, option, env_name):
+        val = self._get_val(section, option, env_name, '')
+        if not val:
+            return []
+        return [item.strip() for item in val.split(',') if item.strip()]
+
+    @property
+    def user_whitelist(self):
+        return self._get_list('Cache', 'USER_WHITELIST', 'USER_WHITELIST')
+
+    @property
+    def user_blacklist(self):
+        return self._get_list('Cache', 'USER_BLACKLIST', 'USER_BLACKLIST')
+
+    @property
+    def library_whitelist(self):
+        return self._get_list('Cache', 'LIBRARY_WHITELIST', 'LIBRARY_WHITELIST')
+
+    @property
+    def library_blacklist(self):
+        return self._get_list('Cache', 'LIBRARY_BLACKLIST', 'LIBRARY_BLACKLIST')
+
+    @property
+    def queue_file(self):
+        return self._get_val('Cache', 'QUEUE_FILE', 'QUEUE_FILE', './config/queue.json')
+
+    @property
+    def max_cpu_percent_limit(self):
+        return self._get_val('Cache', 'MAX_CPU_PERCENT_LIMIT', 'MAX_CPU_PERCENT_LIMIT', 0.0, float)
+
+    @property
+    def max_mem_percent_limit(self):
+        return self._get_val('Cache', 'MAX_MEM_PERCENT_LIMIT', 'MAX_MEM_PERCENT_LIMIT', 0.0, float)
 

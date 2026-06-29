@@ -2,12 +2,12 @@ import logging
 from plexapi.server import PlexServer
 from plexapi.video import Episode
 
-def connect_to_plex(plex_url, plex_token):
+def connect_to_plex(plex_url, plex_token, timeout=10.0):
     """
     Connects to the Plex Media Server using URL and API Token.
     """
     try:
-        plex = PlexServer(plex_url, plex_token)
+        plex = PlexServer(plex_url, plex_token, timeout=timeout)
         logging.info(f"Successfully connected to Plex server at: {plex_url}")
         return plex
     except Exception as e:
@@ -34,17 +34,19 @@ def get_next_episodes_for_session(plex, session, count=1):
             show = plex.library.section(section_title).get(show_title)
             all_episodes = show.episodes()
             
-        current_season_num = session.parentIndex
-        current_episode_num = session.index
+        current_season_num = session.parentIndex or 0
+        current_episode_num = session.index or 0
         
         # Filter for upcoming episodes (future seasons, or current season with higher index)
         next_episodes = []
         for ep in all_episodes:
-            if (ep.seasonNumber > current_season_num) or (ep.seasonNumber == current_season_num and ep.index > current_episode_num):
+            ep_season = ep.seasonNumber or 0
+            ep_index = ep.index or 0
+            if (ep_season > current_season_num) or (ep_season == current_season_num and ep_index > current_episode_num):
                 next_episodes.append(ep)
                 
-        # Sort by season number and episode number index
-        next_episodes.sort(key=lambda ep: (ep.seasonNumber, ep.index))
+        # Sort by season number and episode number index, handling potential None values safely
+        next_episodes.sort(key=lambda ep: (ep.seasonNumber or 0, ep.index or 0))
         
         logging.debug(f"Found {len(next_episodes)} total upcoming episodes for show '{session.grandparentTitle}'. Request limit: {count}")
         return next_episodes[:count]
