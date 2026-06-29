@@ -206,6 +206,12 @@ class ConfigEditScreen(ModalScreen):
             
             yield Label("Max Memory Load Limit (%): (0 to disable)", classes="config_label")
             yield Input(str(self.config.max_mem_percent_limit), id="input_mem_limit")
+
+            yield Label("Max History Count:", classes="config_label")
+            yield Input(str(self.config.max_history_count), id="input_history_count")
+
+            yield Label("Max History Age (Days):", classes="config_label")
+            yield Input(str(self.config.max_history_age_days), id="input_history_age")
             
             yield Label("User Whitelist (comma-separated):", classes="config_label")
             yield Input(", ".join(self.config.user_whitelist), id="input_user_whitelist")
@@ -231,6 +237,8 @@ class ConfigEditScreen(ModalScreen):
                 threshold = int(self.query_one("#input_threshold", Input).value)
                 cpu_limit = float(self.query_one("#input_cpu_limit", Input).value)
                 mem_limit = float(self.query_one("#input_mem_limit", Input).value)
+                history_count = int(self.query_one("#input_history_count", Input).value)
+                history_age = float(self.query_one("#input_history_age", Input).value)
                 user_wl = self.query_one("#input_user_whitelist", Input).value
                 user_bl = self.query_one("#input_user_blacklist", Input).value
                 lib_wl = self.query_one("#input_library_whitelist", Input).value
@@ -249,6 +257,8 @@ class ConfigEditScreen(ModalScreen):
                 parser.set("Cache", "CACHE_START_THRESHOLD_PCT", str(threshold))
                 parser.set("Cache", "MAX_CPU_PERCENT_LIMIT", str(cpu_limit))
                 parser.set("Cache", "MAX_MEM_PERCENT_LIMIT", str(mem_limit))
+                parser.set("Cache", "MAX_HISTORY_COUNT", str(history_count))
+                parser.set("Cache", "MAX_HISTORY_AGE_DAYS", str(history_age))
                 parser.set("Cache", "USER_WHITELIST", user_wl)
                 parser.set("Cache", "USER_BLACKLIST", user_bl)
                 parser.set("Cache", "LIBRARY_WHITELIST", lib_wl)
@@ -728,9 +738,12 @@ class TUIDashboard(App):
                 row_key = get_row_key(table, table.cursor_row)
                 if row_key and row_key.value:
                     file_path = row_key.value
-                    if self.queue_manager.cancel_task(file_path):
-                        logging.info(f"TUI Queue Control: Canceled caching for '{os.path.basename(file_path)}'")
-                        self.refresh_dashboard()
+                    if getattr(self, 'view_only', False):
+                        self.modify_task_status_external(file_path, delete=True)
+                    else:
+                        if self.queue_manager.cancel_task(file_path):
+                            logging.info(f"TUI Queue Control: Canceled caching for '{os.path.basename(file_path)}'")
+                            self.refresh_dashboard()
             except Exception as e:
                 logging.debug(f"TUI Queue Control Error: {e}")
 
@@ -741,9 +754,12 @@ class TUIDashboard(App):
                 row_key = get_row_key(table, table.cursor_row)
                 if row_key and row_key.value:
                     file_path = row_key.value
-                    if self.queue_manager.prioritize_task(file_path):
-                        logging.info(f"TUI Queue Control: Prioritized '{os.path.basename(file_path)}' to the top of the queue.")
-                        self.refresh_dashboard()
+                    if getattr(self, 'view_only', False):
+                        self.modify_task_status_external(file_path, priority=True)
+                    else:
+                        if self.queue_manager.prioritize_task(file_path):
+                            logging.info(f"TUI Queue Control: Prioritized '{os.path.basename(file_path)}' to the top of the queue.")
+                            self.refresh_dashboard()
             except Exception as e:
                 logging.debug(f"TUI Queue Control Error: {e}")
 
@@ -754,11 +770,227 @@ class TUIDashboard(App):
                 row_key = get_row_key(table, table.cursor_row)
                 if row_key and row_key.value:
                     file_path = row_key.value
-                    if self.queue_manager.retry_task(file_path):
-                        logging.info(f"TUI Queue Control: Reset and retried task '{os.path.basename(file_path)}'")
-                        self.refresh_dashboard()
+                    if getattr(self, 'view_only', False):
+                        self.modify_task_status_external(file_path, retry=True)
+                    else:
+                        if self.queue_manager.retry_task(file_path):
+                            logging.info(f"TUI Queue Control: Reset and retried task '{os.path.basename(file_path)}'")
+                            self.refresh_dashboard()
             except Exception as e:
                 logging.debug(f"TUI Queue Control Error: {e}")
+
+    def modify_task_status_external(self, file_path, delete=False, priority=False, retry=False):
+        import json
+        queue_file = self.config.queue_file
+        if not os.path.exists(queue_file):
+            return
+        try:
+            with open(queue_file, 'r') as f:
+                queue_data = json.load(f)
+                
+            if file_path in queue_data:
+                if delete:
+                    del queue_data[file_path]
+                elif priority:
+                    queue_data[file_path]["priority_score"] = 999999
+                elif retry:
+                    queue_data[file_path]["status"] = "Pending"
+                    queue_data[file_path]["retry_count"] = 0
+                    queue_data[file_path]["finished_time"] = None
+                    queue_data[file_path]["pid"] = "-"
+                    
+                with open(queue_file, 'w') as f:
+                    json.dump(queue_data, f, indent=4)
+                    
+                action_name = "canceled" if delete else ("prioritized" if priority else "retried")
+                filename = os.path.basename(file_path)
+                log_file = self.config.log_file or "./config/bingesentry.log"
+                if os.path.exists(log_file):
+                    with open(log_file, 'a') as f:
+                        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S,%f')[:-3]} INFO: External Control: {action_name.capitalize()} task '{filename}' via TUI View.\n")
+                self.refresh_dashboard_view_only()
+        except Exception as e:
+            logging.error(f"External TUI Control: Failed to modify task: {e}")
+
+    def tail_log_file(self):
+        log_widget = self.query_one("#logs_panel", RichLog)
+        log_file = self.config.log_file or "./config/bingesentry.log"
+        if not os.path.exists(log_file):
+            return
+        try:
+            with open(log_file, 'r') as f:
+                if getattr(self, 'last_log_offset', 0) == 0:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 10240))
+                    f.readline()
+                else:
+                    f.seek(self.last_log_offset)
+                    
+                lines = f.readlines()
+                self.last_log_offset = f.tell()
+                
+                for line in lines:
+                    log_widget.write(line.strip())
+        except Exception:
+            pass
+
+    def refresh_dashboard_view_only(self):
+        self.refresh_sessions_table_view_only()
+        self.refresh_queue_table_view_only()
+
+    def refresh_sessions_table_view_only(self):
+        table = self.query_one("#sessions_table", HoverDataTable)
+        table.clear(columns=True)
+        table.add_columns("User", "Type", "Title / Playing Media", "Progress", "Next Cache Target")
+        
+        sessions_file = os.path.join(os.path.dirname(self.config.queue_file), 'sessions.json')
+        if not os.path.exists(sessions_file):
+            table.add_row("No active sessions on Plex.", "-", "-", "-", "-")
+            return
+            
+        try:
+            with open(sessions_file, 'r') as f:
+                sessions_data = json.load(f)
+        except Exception:
+            sessions_data = []
+            
+        if not sessions_data:
+            table.add_row("No active sessions on Plex.", "-", "-", "-", "-")
+            return
+            
+        for s in sessions_data:
+            table.add_row(
+                s.get("user", "Unknown"),
+                s.get("type", "TV Show"),
+                s.get("title", ""),
+                s.get("progress", ""),
+                s.get("next_cache", "")
+            )
+
+    def refresh_queue_table_view_only(self):
+        import json
+        table = self.query_one("#queue_table", HoverDataTable)
+        
+        saved_key = None
+        if table.cursor_row is not None:
+            try:
+                saved_key = get_row_key(table, table.cursor_row)
+            except Exception:
+                pass
+                
+        table.clear(columns=True)
+        
+        queue_file = self.config.queue_file
+        if not os.path.exists(queue_file):
+            table.add_row("No caching tasks in queue.", "-", "-", "Idle", "-")
+            return
+            
+        try:
+            with open(queue_file, 'r') as f:
+                queue_data = json.load(f)
+        except Exception:
+            queue_data = {}
+            
+        all_tasks = list(queue_data.values())
+        
+        if self.show_history:
+            table.add_columns("File Name", "Size", "Status", "Completed At")
+            history_tasks = [t for t in all_tasks if t.get("status") in ("Completed", "Paused (Error)", "Paused (Failed)")]
+            history_tasks.sort(key=lambda t: t.get("finished_time") or 0, reverse=True)
+            
+            if not history_tasks:
+                table.add_row("No caching history found.", "-", "-", "-")
+                return
+                
+            for task in history_tasks[:15]:
+                filename = truncate_path(task.get("file_path", ""), 32)
+                size_str = f"{task.get('size_gb', 0.0):.2f} GB" if task.get("size_gb", 0) > 0 else "Unknown"
+                status_style = "green" if task.get("status") == "Completed" else "red"
+                status_text = f"[{status_style}]{task.get('status')}[/{status_style}]"
+                finished_at = "-"
+                if task.get("finished_time"):
+                    finished_at = datetime.fromtimestamp(task.get("finished_time")).strftime('%H:%M:%S')
+                table.add_row(filename, size_str, status_text, finished_at, key=task.get("file_path"))
+        else:
+            table.add_columns("File Name", "Size", "PID", "Status", "Elapsed")
+            active_tasks = [t for t in all_tasks if t.get("status") not in ("Completed", "Paused (Error)", "Paused (Failed)")]
+            
+            active_tasks.sort(
+                key=lambda t: (t.get("status") in ("Caching", "Paused") or t.get("status", "").startswith("Paused"), t.get("priority_score", 0) if t.get("status") == "Pending" else -9999),
+                reverse=True
+            )
+            
+            if not active_tasks:
+                table.add_row("No caching tasks in queue.", "-", "-", "Idle", "-")
+                return
+                
+            for task in active_tasks[:10]:
+                filename = truncate_path(task.get("file_path", ""), 32)
+                size_str = f"{task.get('size_gb', 0.0):.2f} GB" if task.get("size_gb", 0) > 0 else "Unknown"
+                pid_str = str(task.get("pid", "-"))
+                
+                status = task.get("status", "Pending")
+                if status == "Caching":
+                    status_text = "[yellow]Caching[/yellow]"
+                elif "Paused" in status:
+                    style = "red" if "Failed" in status or "Error" in status else "yellow"
+                    status_text = f"[{style}]{status}[/{style}]"
+                elif status == "Pending":
+                    offset_val = task.get("offset", 1)
+                    status_text = f"[cyan]Pending (+{offset_val} ep, {task.get('progress_pct', 0.0):.0f}%)[/cyan]"
+                else:
+                    status_text = status
+                    
+                elapsed = "-"
+                table.add_row(filename, size_str, pid_str, status_text, elapsed, key=task.get("file_path"))
+                
+        if saved_key:
+            try:
+                table.cursor_coordinate = Coordinate(table.get_row_index(saved_key), 0)
+            except Exception:
+                pass
+
+    def update_system_stats_view_only(self):
+        uptime_secs = int(time.time() - self.start_time)
+        hours, remainder = divmod(uptime_secs, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        uptime_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        
+        cpu_usage = get_cpu_percent()
+        mem_usage = psutil.virtual_memory().percent
+        
+        status_text = "[bold green](VIEW MODE)[/bold green]"
+        
+        # Get mount free space if possible
+        mount_dir = self.config.rclone_mount_dir or self.config.path_map_to
+        disk_str = ""
+        if mount_dir and os.path.exists(mount_dir):
+            try:
+                from disk import has_enough_disk_space
+                _, free_space_gb = has_enough_disk_space(mount_dir, 0.0)
+                if free_space_gb > 0:
+                    disk_str = f" | Disk: {free_space_gb:.1f} GB free"
+            except Exception:
+                pass
+                
+        # Get bandwidth stats
+        saved_str = ""
+        try:
+            from disk import get_bandwidth_stats
+            stats = get_bandwidth_stats()
+            saved_gb = stats.get("total_saved_bytes", 0) / (1024 ** 3)
+            if saved_gb > 0:
+                saved_str = f" | Saved: {saved_gb:.1f} GB"
+        except Exception:
+            pass
+            
+        header = self.query_one("#header", Label)
+        header.update(
+            f"BingeSentry ➔ {self.plex_url} {status_text} | "
+            f"CPU: {cpu_usage}% | MEM: {mem_usage}%{disk_str}{saved_str} | "
+            f"Uptime: {uptime_str} | Time: {datetime.now().strftime('%H:%M:%S')}"
+        )
 
     def run_loop(self, conn_manager, queue_manager, fetch_sessions_func, scan_trigger_event=None):
         self.conn_manager = conn_manager
@@ -768,3 +1000,9 @@ class TUIDashboard(App):
         
         # Start Textual Event Loop
         self.run()
+
+if __name__ == "__main__":
+    from config import Config
+    config = Config()
+    dashboard = TUIDashboard(config.plex_url, config, None, view_only=True)
+    dashboard.run()

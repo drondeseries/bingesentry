@@ -445,7 +445,10 @@ class CachingQueueManager:
         Schedules next tasks up to concurrency limit based on episode progress percentages.
         """
         self.update_task_statuses()
-        self.cleanup_completed_tasks()
+        self.cleanup_completed_tasks(
+            max_age_seconds=int(self.config.max_history_age_days * 86400),
+            max_history_count=self.config.max_history_count
+        )
         
         running_tasks = [t for t in self.tasks.values() if t.process is not None]
         max_concurrent = self.config.max_concurrent_caches

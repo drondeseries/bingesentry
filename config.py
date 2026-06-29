@@ -157,3 +157,11 @@ class Config:
     def max_mem_percent_limit(self):
         return self._get_val('Cache', 'MAX_MEM_PERCENT_LIMIT', 'MAX_MEM_PERCENT_LIMIT', 0.0, float)
 
+    @property
+    def max_history_count(self):
+        return self._get_val('Cache', 'MAX_HISTORY_COUNT', 'MAX_HISTORY_COUNT', 50, int)
+
+    @property
+    def max_history_age_days(self):
+        return self._get_val('Cache', 'MAX_HISTORY_AGE_DAYS', 'MAX_HISTORY_AGE_DAYS', 7.0, float)
+

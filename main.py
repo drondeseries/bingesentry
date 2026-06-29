@@ -31,6 +31,82 @@ def colorize(message, color_key):
 
 _last_scan_time = 0.0
 
+def save_sessions_json(currently_playing, config, queue_manager):
+    import json
+    sessions_data = []
+    if currently_playing:
+        for session in currently_playing:
+            user = session.usernames[0] if session.usernames else "Unknown User"
+            if isinstance(session, Episode):
+                show = session.grandparentTitle
+                season_num = session.parentIndex
+                episode_num = session.index
+                title = f"{show} (S{season_num}E{episode_num})"
+                
+                duration = getattr(session, 'duration', 0)
+                view_offset = getattr(session, 'viewOffset', 0)
+                pct = int((view_offset / duration) * 100) if duration > 0 else 0
+                progress = f"{pct}%" if duration > 0 else "Playing"
+                
+                next_cache = "None"
+                file_path = getattr(session, '_next_cache_file', None)
+                if getattr(session, '_cache_filtered', False):
+                    next_cache = "Filtered (User/Library)"
+                elif getattr(session, '_end_of_show', False):
+                    next_cache = "End of Show"
+                elif file_path is not None:
+                    is_cached, cached_pct, _, _ = get_cache_status(
+                        file_path,
+                        config.rclone_cache_dir,
+                        config.rclone_remote_name,
+                        config.rclone_mount_dir or config.path_map_to
+                    )
+                    filename = os.path.basename(file_path)
+                    if is_cached:
+                        next_cache = f"{filename} (100%)"
+                    elif cached_pct > 0:
+                        next_cache = f"{filename} ({cached_pct:.1f}%)"
+                    else:
+                        task = queue_manager.get_task(file_path)
+                        if task:
+                            if task.status == "Pending":
+                                next_cache = f"{filename} (queued)"
+                            elif "Paused" in task.status:
+                                next_cache = f"{filename} (paused)"
+                            else:
+                                next_cache = f"{filename} (caching...)"
+                        else:
+                            next_cache = f"{filename} (not cached)"
+                
+                sessions_data.append({
+                    "user": user,
+                    "type": "TV Show",
+                    "title": title,
+                    "progress": progress,
+                    "next_cache": next_cache
+                })
+            else:
+                movie_title = getattr(session, 'title', 'Unknown Movie')
+                progress = "Playing"
+                duration = getattr(session, 'duration', 0)
+                view_offset = getattr(session, 'viewOffset', 0)
+                if duration > 0:
+                    pct = int((view_offset / duration) * 100)
+                    progress = f"{pct}%"
+                sessions_data.append({
+                    "user": user,
+                    "type": "Movie",
+                    "title": movie_title,
+                    "progress": progress,
+                    "next_cache": "- (No cache required)"
+                })
+    try:
+        sessions_file = os.path.join(os.path.dirname(config.queue_file), 'sessions.json')
+        with open(sessions_file, 'w') as f:
+            json.dump(sessions_data, f, indent=4)
+    except Exception as e:
+        logging.error(f"Failed to write sessions.json: {e}")
+
 def check_sessions(conn_manager, config, queue_manager, tui_dashboard=None, force=False):
     """
     Scans active sessions, logs streaming activity, maps paths, and triggers caches.
@@ -68,6 +144,7 @@ def check_sessions(conn_manager, config, queue_manager, tui_dashboard=None, forc
 
     if not currently_playing:
         logging.info("No active media sessions currently playing on Plex.")
+        save_sessions_json([], config, queue_manager)
         # Process queue to check for completion and launch next tasks when Plex is idle
         queue_manager.process_queue()
         return
@@ -234,6 +311,7 @@ def check_sessions(conn_manager, config, queue_manager, tui_dashboard=None, forc
             
     # Process sequential downloads queue
     queue_manager.process_queue()
+    save_sessions_json(currently_playing, config, queue_manager)
     
     # Output playback session summaries
     if shows_list or movies_list:
