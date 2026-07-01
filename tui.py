@@ -9,8 +9,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, DataTable, RichLog, Label, Input, Button
 from textual.containers import Grid, Vertical, Container, Horizontal
 from textual.coordinate import Coordinate
+import json
 from textual import work, events
-from disk import get_cache_status, is_mount_responsive, get_cpu_percent
+from disk import get_cache_status, is_mount_responsive, get_cpu_percent, map_path, resolve_existing_path, has_enough_disk_space, get_bandwidth_stats
 
 def truncate_text(text, max_len=25):
     if len(text) <= max_len:
@@ -465,7 +466,6 @@ class TUIDashboard(App):
         disk_str = ""
         if self.mount_healthy and mount_dir:
             try:
-                from disk import has_enough_disk_space
                 _, free_space_gb = has_enough_disk_space(mount_dir, 0.0)
                 if free_space_gb > 0:
                     disk_str = f" | Disk: {free_space_gb:.1f} GB free"
@@ -475,7 +475,6 @@ class TUIDashboard(App):
         # Get bandwidth stats
         saved_str = ""
         try:
-            from disk import get_bandwidth_stats
             stats = get_bandwidth_stats()
             saved_gb = stats.get("total_saved_bytes", 0) / (1024 ** 3)
             if saved_gb > 0:
@@ -503,7 +502,6 @@ class TUIDashboard(App):
             table.add_row("No active sessions on Plex.", "-", "-", "-", "-")
             return
             
-        from main import map_path, resolve_existing_path
         for session in self.active_sessions:
             user = session.usernames[0] if session.usernames else "Unknown"
             if session.type == "episode":
@@ -787,7 +785,7 @@ class TUIDashboard(App):
                 logging.debug(f"TUI Queue Control Error: {e}")
 
     def modify_task_status_external(self, file_path, delete=False, priority=False, retry=False):
-        import json
+
         queue_file = self.config.queue_file
         if not os.path.exists(queue_file):
             return
@@ -857,6 +855,7 @@ class TUIDashboard(App):
             return
             
         try:
+
             with open(sessions_file, 'r') as f:
                 sessions_data = json.load(f)
         except Exception:
@@ -876,7 +875,7 @@ class TUIDashboard(App):
             )
 
     def refresh_queue_table_view_only(self):
-        import json
+
         table = self.query_one("#queue_table", HoverDataTable)
         
         saved_key = None
@@ -974,7 +973,6 @@ class TUIDashboard(App):
         disk_str = ""
         if mount_dir and os.path.exists(mount_dir):
             try:
-                from disk import has_enough_disk_space
                 _, free_space_gb = has_enough_disk_space(mount_dir, 0.0)
                 if free_space_gb > 0:
                     disk_str = f" | Disk: {free_space_gb:.1f} GB free"
@@ -984,7 +982,6 @@ class TUIDashboard(App):
         # Get bandwidth stats
         saved_str = ""
         try:
-            from disk import get_bandwidth_stats
             stats = get_bandwidth_stats()
             saved_gb = stats.get("total_saved_bytes", 0) / (1024 ** 3)
             if saved_gb > 0:
