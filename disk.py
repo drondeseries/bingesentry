@@ -149,7 +149,7 @@ def get_cache_status(file_path, cache_dir, remote_name, mount_dir):
         
     import json
     try:
-        from disk import is_file_in_mount; is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
+        is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
         if not is_inside:
             return False, 0.0, 0, 0
         
