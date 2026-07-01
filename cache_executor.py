@@ -106,7 +106,9 @@ def main():
     logging.info(f"Starting smart cache for: '{filename}'")
     
     # Follow symlinks to locate real path
-    file_path_real = os.path.realpath(file_path)
+    from disk import resolve_existing_path
+    file_path_resolved = resolve_existing_path(file_path)
+    file_path_real = os.path.realpath(file_path_resolved)
     if not os.path.exists(file_path_real):
         logging.error(f"Target file does not exist: '{file_path_real}'")
         sys.exit(2)
@@ -125,7 +127,8 @@ def main():
     vfs_meta_found = False
     
     if cache_dir and remote_name and mount_dir:
-        from disk import is_file_in_mount; is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
+        from disk import is_file_in_mount
+        is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
         if is_inside:
             meta_file_path = os.path.join(cache_dir, 'vfsMeta', remote_name, relative_path)
             
@@ -145,8 +148,6 @@ def main():
                     logging.warning(f"Failed to read vfsMeta file '{meta_file_path}': {e}")
             else:
                 logging.debug(f"vfsMeta file not found at: '{meta_file_path}'")
-        else:
-            logging.debug(f"File '{file_path_abs}' is outside mount directory '{mount_dir_abs}'")
             
     if not vfs_meta_found:
         logging.info("VFS Metadata not available. Caching the entire file sequentially.")
