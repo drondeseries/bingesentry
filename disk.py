@@ -149,19 +149,7 @@ def get_cache_status(file_path, cache_dir, remote_name, mount_dir):
         
     import json
     try:
-        # Resolve symlink (e.g. follow /mnt/usenet-rclone to /mnt/altmount-rclone)
-        file_path_real = os.path.realpath(file_path)
-        mount_dir_real = os.path.realpath(mount_dir)
-        
-        file_path_abs = os.path.abspath(file_path_real)
-        mount_dir_abs = os.path.abspath(mount_dir_real)
-        
-        try:
-            relative_path = os.path.relpath(file_path_abs, mount_dir_abs)
-            is_inside = not relative_path.startswith('..') and not os.path.isabs(relative_path)
-        except ValueError:
-            is_inside = False
-
+        from disk import is_file_in_mount; is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
         if not is_inside:
             return False, 0.0, 0, 0
         
@@ -227,3 +215,18 @@ def get_bandwidth_stats(stats_file_path="./config/stats.json"):
         pass
     return {"total_saved_bytes": 0, "total_read_bytes": 0, "files_cached": 0}
 
+
+def is_file_in_mount(file_path, mount_dir):
+    """Checks if a file is inside a mount directory."""
+    file_path_real = os.path.realpath(file_path)
+    mount_dir_real = os.path.realpath(mount_dir)
+    file_path_abs = os.path.abspath(file_path_real)
+    mount_dir_abs = os.path.abspath(mount_dir_real)
+
+    try:
+        relative_path = os.path.relpath(file_path_abs, mount_dir_abs)
+        is_inside = not relative_path.startswith('..') and not os.path.isabs(relative_path)
+    except ValueError:
+        is_inside = False
+        relative_path = ""
+    return is_inside, relative_path

@@ -125,16 +125,7 @@ def main():
     vfs_meta_found = False
     
     if cache_dir and remote_name and mount_dir:
-        mount_dir_real = os.path.realpath(mount_dir)
-        file_path_abs = os.path.abspath(file_path_real)
-        mount_dir_abs = os.path.abspath(mount_dir_real)
-        
-        try:
-            relative_path = os.path.relpath(file_path_abs, mount_dir_abs)
-            is_inside = not relative_path.startswith('..') and not os.path.isabs(relative_path)
-        except ValueError:
-            is_inside = False
-
+        from disk import is_file_in_mount; is_inside, relative_path = is_file_in_mount(file_path, mount_dir)
         if is_inside:
             meta_file_path = os.path.join(cache_dir, 'vfsMeta', remote_name, relative_path)
             
