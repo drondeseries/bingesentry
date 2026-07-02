@@ -3,13 +3,15 @@ import re
 import time
 import logging
 from datetime import datetime
+import json
 import psutil
 from textual.app import App, ComposeResult
 from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, DataTable, RichLog, Label, Input, Button
 from textual.containers import Grid, Vertical, Container, Horizontal
 from textual.coordinate import Coordinate
-import json
+
+
 from textual import work, events
 from disk import get_cache_status, is_mount_responsive, get_cpu_percent, map_path, resolve_existing_path, has_enough_disk_space, get_bandwidth_stats
 
@@ -363,6 +365,14 @@ class TUIDashboard(App):
         self.start_time = time.time()
         self.mount_healthy = True
         self.show_history = False
+        self.queue_manager = None
+        self.conn_manager = None
+        self.fetch_sessions_func = None
+        self.scan_trigger_event = None
+        self.is_paused = False
+        self._is_periodic_scan = False
+        self.textual_log_handler = None
+        self.last_log_offset = 0
         
         self.active_sessions = []
         self.view_only = view_only
@@ -585,6 +595,8 @@ class TUIDashboard(App):
                 table.add_row(user, "Movie", movie_title_truncated, progress, "- (No cache required)", key=movie_file)
 
     def refresh_queue_table(self):
+        if not hasattr(self, "queue_manager") or self.queue_manager is None:
+            return
         table = self.query_one("#queue_table", HoverDataTable)
         all_tasks = self.queue_manager.get_all_tasks()
         
